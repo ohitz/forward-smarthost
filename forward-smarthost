@@ -1,0 +1,213 @@
+#!/usr/bin/perl
+#
+# Quick and dirty mail forward to a smarthost.
+#
+# Copyright (C) 2016 Oliver Hitz <oliver@net-track.ch>
+
+use Getopt::Long;
+use IO::Socket::INET;
+use IO::Select;
+use Sys::Syslog;
+use strict;
+use warnings;
+
+my $timeout = 30;
+my $port = 25;
+
+my $sock;
+my $server;
+
+my $opt_no_log;
+my $opt_debug;
+my $opt_help;
+
+if (!GetOptions("n|no-log" => \$opt_no_log,
+                "d|debug" => \$opt_debug,
+                "h|help" => \$opt_help)) {
+  usage();
+  exit 100;
+}
+
+if ($opt_help) {
+  usage();
+  exit 0;
+}
+
+if (!defined $ENV{SENDER}) {
+  print "SENDER environment variable not defined!\n";
+  # Delivery failed permanently.
+  exit 100;
+}
+if (!defined $ENV{RECIPIENT}) {
+  print "RECIPIENT environment variable not defined!\n";
+  # Delivery failed permanently.
+  exit 100;
+}
+
+my $sender = $ENV{SENDER}; 
+my $recipient = $ENV{RECIPIENT}; 
+
+# Strip off domain@- from beginning of recipient.
+$recipient =~ s/^[^@]*@-//;
+
+my @servers;
+
+if ($#ARGV < 0) {
+  usage();
+  exit 100;
+}
+
+openlog("forward-smarthost", "pid", "mail");
+
+foreach $server (@ARGV) {
+  debug("Connecting to %s\n", $server);
+  
+  my $sock = IO::Socket::INET->new( PeerAddr => $server,
+                                    PeerPort => $port,
+                                    Type => SOCK_STREAM );
+  if (!$sock) {
+    next;
+  }
+
+  my $success = smtp($sock, $server);
+  close($sock);
+
+  if ($success) {
+    # Delivery was successful.
+    syslog("info", "from:$sender to:$recipient via:$server");
+    closelog();
+    exit 0;
+  }
+}
+
+# Soft error, retry later.
+closelog();
+exit 111;
+
+sub usage
+{
+  print "Usage: $0 [OPTIONS] server1 server2 ...
+
+Forwards email received on STDIN to the first of the specified servers which
+accepts it.
+
+The envelope sender and recipient are taken from the SENDER and RECIPIENT
+environment variable. Strips off 'domain@-' from the beginning of RECIPIENT.
+
+Options:
+
+-n|--no-log
+                Don't log to syslog
+-d|--debug
+                Print debugging output on STDERR.
+-h|--help
+		Show help.
+";
+}
+
+sub debug
+{
+  my $format = shift;
+  my (@args) = @_;
+
+  if ($opt_debug) {
+    printf STDERR ($format, @args);
+  }
+}
+
+sub recv_data
+{
+  my $sock = shift;
+
+  my $wait = IO::Select->new();
+  $wait->add($sock);
+
+  if ($wait->can_read($timeout)) {
+    my $data;
+
+    if (defined $sock->recv($data, 10240)) {
+      debug("<- %s", $data);
+      return $data;
+    } else {
+      return undef;
+    }
+  }
+
+  return undef;
+}
+
+sub send_data
+{
+  my $sock = shift;
+  my $cmd = shift;
+
+  debug("-> %s", $cmd);
+  print $sock $cmd;
+}
+
+sub smtp
+{
+  my $sock = shift;
+  my $server = shift;
+
+  # Receive banner
+  my $data = recv_data($sock);
+  if (!$data) {
+    return 0;
+  }
+  
+  debug("Connected, banner: %s", $data);
+  if ($data !~ /^220/) {
+    syslog("info", "from:$sender to:$recipient connect:".(split /\n/, $data)[0]);
+    return 0;
+  }
+
+  # Send EHLO
+  send_data($sock, "EHLO $server\n");
+  $data = recv_data($sock);
+  if (!$data || $data !~ /^250/) {
+    syslog("info", "from:$sender to:$recipient ehlo:".(split /\n/, $data)[0]);
+    return 0;
+  }
+
+  # Send MAIL FROM
+  send_data($sock, "MAIL FROM:<$sender>\n");
+  $data = recv_data($sock);
+  if (!$data || $data !~ /^250/) {
+    syslog("info", "from:$sender to:$recipient mail-from:".(split /\n/, $data)[0]);
+    return 0;
+  }
+
+  # Send RCPT TO
+  send_data($sock, "RCPT TO:<$recipient>\n");
+  $data = recv_data($sock);
+  if (!$data || $data !~ /^250/) {
+    syslog("info", "from:$sender to:$recipient rcpt-to:".(split /\n/, $data)[0]);
+    return 0;
+  }
+
+  # Send DATA
+  send_data($sock, "DATA\n");
+  $data = recv_data($sock);
+  if (!$data || $data !~ /^354/) {
+    syslog("info", "from:$sender to:$recipient data:".(split /\n/, $data)[0]);
+    return 0;
+  }
+
+  # Send the message.
+  while (my $line = <STDIN>) {
+    send_data($sock, $line);
+  }
+
+  send_data($sock, "\r\n.\r\n");
+
+  $data = recv_data($sock);
+  if (!$data || $data !~ /^250/) {
+    # Signal a soft error. We can't rewind stdin, so quit here.
+    syslog("info", "from:$sender to:$recipient status:".(split /\n/, $data)[0]);
+    closelog();
+    exit 111;
+  }
+  
+  return 1;
+}
